@@ -1,4 +1,5 @@
 source("./R/utils.R")
+source("./R/serial.R")
 
 ##Constants
 
@@ -77,7 +78,7 @@ evaluate <- function(docSessionId) {
   
   ##we need to ensure these both happen or fail###########
   ##send cmd complete msg
-  sendCompletionStatus(docState)
+  sendDocStatus(docState)
   ##save the state
   setDocState(docSessionId,docState)
   ########################################################
@@ -114,12 +115,21 @@ initializeDocState <- function(docSessionId) {
     docSessionId=docSessionId,
     firstDirtyIndex=1,
     lines=list(),
+    varTable = list(),
     cmdIndex=INIT_CMD_INDEX
   )
-  setDocState(docSessionId,docState)
-  sendCompletionStatus(docState)
   
-  docState
+  ## DO I NEED  MESSAGE BEFORE THIS? =========
+  initVarList <- getInitVarList()
+  initVarVersions <- getInitVarVersions()
+  initEnvVarNames <- createVersionedNames(initVarVersions)
+  docState <- updateVarTable(docState,INIT_LINE_ID,initEnvVarNames,character(),initVarList)
+  ##===============================
+  
+  setDocState(docSessionId,docState)
+  sendDocStatus(docState)
+  
+  invisible(docState)
 }
 
 
@@ -161,7 +171,7 @@ executeCommand <- function(docSessionId,cmd,envir=NULL) {
 
   ##we need to ensure these both happen or fail###########
   ##send cmd complete msg
-  sendCompletionStatus(docState)
+  sendDocStatus(docState)
   ##save the state
   setDocState(docSessionId,docState)
   ########################################################
@@ -238,7 +248,7 @@ setDocState <- function(docSessionId,docState) {
   docStates <- rlang::env_get(.sessionStateEnv.,"docStates")
   docStates[[docSessionId]] = docState
   rlang::env_bind(.sessionStateEnv.,docStates=docStates)
-  docState
+  invisible(docState)
 }
 
 ## Gets the doc state for the given session ID
@@ -277,7 +287,8 @@ evaluateDocState <- function(docState,envir) {
     
     ##new working line
     prevLine <- if (docState$firstDirtyIndex > 1) docState$lines[[docState$firstDirtyIndex - 1]] else NULL
-    modLine <- docState$lines[[docState$firstDirtyIndex]]
+    oldLine <- docState$lines[[docState$firstDirtyIndex]]
+    modLine <- oldLine
 
     if(!is.null(prevLine)) {
       prevLineId <- prevLine$lineId
@@ -293,8 +304,11 @@ evaluateDocState <- function(docState,envir) {
       inVarVersions <- getInitVarVersions()
     }
     
+    #some processing flags
     reval <- FALSE
     nonCodeInputsChanged <- FALSE
+    doEnvironmentVarUpdate <- FALSE
+    doLineDisplayUpdate <- FALSE
     
     ##------------------------
     ## Process an input change
@@ -356,6 +370,8 @@ evaluateDocState <- function(docState,envir) {
       modLine$outVarList <- outVarList
       modLine$outVarVersions <- outVarVersions
       modLine$outIndex <- currentCmdIndex
+      
+      doEnvironmentVarUpdate <- TRUE
     }
 
     ##------------------------
@@ -365,6 +381,9 @@ evaluateDocState <- function(docState,envir) {
       if(firstReval) {
         modLine <- evalCode(docState$docSessionId,modLine,currentCmdIndex,envir)
         firstReval <- FALSE
+        
+        doEnvironmentVarUpdate <- TRUE
+        doLineDisplayUpdate <- TRUE # note: we need doEnvironmentVarUpdate == TRUE to do this
       }
       else {
         ##do not evaluate, and stop checking lines
@@ -373,9 +392,36 @@ evaluateDocState <- function(docState,envir) {
       }
     }
     
+    ## cell and doc environment variables processing
+    if(doEnvironmentVarUpdate) {
+      ##get the line env values
+      modLine$envVarNames <- createVersionedNames(modLine$outVarVersions)
+      
+      ##note - updateVarTable has side effect of sending the update table message
+      ##send var table update first - so receivers of other messages can use it for decoding
+      docState <- updateVarTable(docState,modLine$lineId,modLine$envVarNames,oldLine$envVarNames,modLine$outVarList)
+      
+      ##cell env var message
+      sendCellEnvMessage(docState$docSessionId,modLine)
+      
+      ## find the line output and send the message
+      ## this requires the envVarNames to be set to calculate the message
+      ## and the recipient required the var table to unpack it.
+      if(doLineDisplayUpdate) {
+        lineDisplayData <- getLineDisplayData(modLine,envir)
+        if(!is.null(lineDisplayData)) {
+          modLine$displayData <- lineDisplayData
+          sendLineDisplayMessage(docState$docSessionId,modLine)
+        }
+      }
+    }
+    
     ##update state for new line
     docState$lines[[docState$firstDirtyIndex]] <- modLine
     if(!evaluationInterrupted) {
+      
+      sendCellStatusMessage(docState,modLine)
+      
       docState$firstDirtyIndex <- docState$firstDirtyIndex + 1
     }
   }
@@ -402,20 +448,26 @@ evalCode <- function(docSessionId,modLine,currentCmdIndex,envir) {
   sendEvalMessage(docSessionId,modLine$lineId,currentCmdIndex)
   
   ##evaluate, printing outputs to the console
+  ##withCallHandlers - captures messages adn warnings without exiting
+  ##tryCatch - captures errors with exiting
   if(modLine$parseValid) {
-    tryCatch({
-      ##this evaluates the exprs with autoprint, like the console does
-      withAutoprint(exprs=modLine$exprs,local=envir,evaluated=TRUE,echo=FALSE)
-    },
-    error=function(err) {
-      sendConsoleMessage("stderr",err$message,docSessionId)
-    },
-    warning=function(wrn) {
-      sendConsoleMessage("stdwrn",wrn$message,docSessionId)
-    },
-    message=function(m) {
-      sendConsoleMessage("stdmsg",m$message,docSessionId)
-    }
+    tryCatch(
+      withCallingHandlers({
+          ##this evaluates the exprs with autoprint, like the console does
+          withAutoprint(exprs=modLine$exprs,local=envir,evaluated=TRUE,echo=FALSE)
+        },
+        warning=function(wrn) {
+          sendConsoleMessage("stdwrn",wrn$message,docSessionId)
+          rlang::cnd_muffle(wrn)
+        },
+        message=function(m) {
+          sendConsoleMessage("stdmsg",m$message,docSessionId)
+          rlang::cnd_muffle(m)
+        }
+      ),
+      error=function(err) {
+        sendConsoleMessage("stderr",err$message,docSessionId)
+      }
     )
   }
   else {
@@ -431,11 +483,6 @@ evalCode <- function(docSessionId,modLine,currentCmdIndex,envir) {
   
   ##save the final var list
   modLine <- updateLineOutputs(modLine,envir,currentCmdIndex)
-  
-  ## send variable values
-  sendValuesMessage(docSessionId,modLine)
-  
-  modLine
 }
 
 ## This updates the line outputs for a newly evaluated entry
@@ -448,7 +495,11 @@ updateLineOutputs <- function(oldLine,envir,currentCmdIndex) {
   kept <- intersect(names(oldLine$inVarList),names(newVarList))
   created <- setdiff(names(newVarList),names(oldLine$inVarList))
   deleted <- setdiff(names(oldLine$inVarList),names(newVarList))
-  updated <- kept[sapply(kept,function(varName) !identical(oldLine$inVarList[[varName]],newVarList[[varName]]))]
+  if(length(kept) > 0) {
+    updated <- kept[sapply(kept,function(varName) !identical(oldLine$inVarList[[varName]],newVarList[[varName]]))]
+  } else {
+    updated <- character(0)
+  }
   unchanged <- setdiff(kept,updated)
   
   ##set the versions for each variable value
@@ -495,6 +546,123 @@ updateLineOutputs <- function(oldLine,envir,currentCmdIndex) {
   newLine
 }
 
+createVersionedNames <- function(varVersions) {
+  versionedNames <- paste(names(varVersions),varVersions,sep="|")
+  names(versionedNames) <- names(varVersions)
+  versionedNames
+}
+
+## This updates the variable table in the state
+## It also has the side effect of sending the var table udpate message, since we can
+## calculate the deltas here
+updateVarTable <- function(docState,lineId,newEnvVarNames,oldEnvVarNames,newVarList) {
+  cellAddNames <- setdiff(newEnvVarNames,oldEnvVarNames)
+  cellDropNames <- setdiff(oldEnvVarNames,newEnvVarNames)
+  
+  modVarList <- newVarList
+  names(modVarList) <- newEnvVarNames  ##change the names on the var list so we can look up the added values
+  cellAddValues <- modVarList[cellAddNames]
+  
+  stateData <- list(varTable=docState$varTable,adds=character(),drops=character())
+  stateData <- purrr::reduce2(cellAddNames,cellAddValues,processCellAdds,lineId=lineId,.init=stateData)
+  stateData <- purrr::reduce(cellDropNames,processCellDrops,lineId=lineId,.init=stateData)
+  
+  docState$varTable <- stateData$varTable
+  
+  ##send doc environment message - add as list of values, drops as vector of names
+  addList <- modVarList[stateData$adds]
+  names(addList) <- stateData$adds
+  sendDocEnvMessage(docState,lineId,addList,stateData$drops)
+  
+  invisible(docState)
+}
+
+processCellAdds <- function(stateData,cellAddName,value,lineId) {
+  varTable <- stateData$varTable
+  adds <- stateData$adds
+  if(hasName(varTable,cellAddName)) {
+    cellList <- varTable[[cellAddName]]$lines
+    if(! (lineId %in% cellList) ) {  #it shouldn't be there
+      varTable[[cellAddName]]$lines <- c(cellList,lineId)
+    }
+  }
+  else {
+    varTable[[cellAddName]] <- list(lines=lineId,value=value)
+    adds <- c(adds,cellAddName)
+  }
+  stateData$varTable <- varTable
+  stateData$adds <- adds
+  invisible(stateData)
+}
+
+processCellDrops <- function(stateData,cellDropName,lineId) {
+  varTable <- stateData$varTable
+  drops <- stateData$drops
+  if(hasName(varTable,cellDropName)) { #it should be here
+    cellList <- varTable[[cellDropName]]$lines
+    newCellList <- cellList[cellList != lineId]
+    varTable[[cellDropName]]$lines <- newCellList
+    if(length(newCellList) == 0) {
+      drops <- c(drops,cellDropName)
+    }
+    
+  }
+  stateData$varTable <- varTable
+  stateData$drops <- drops
+  invisible(stateData)
+}
+
+ASSIGN_SYMBOLS <- c("<-","<<-","=")
+isAssignment <- function(expr) {
+  if(rlang::is_call(expr)) {
+    callee <- as.character(expr[[1]])
+    callee %in% ASSIGN_SYMBOLS
+  }
+  else FALSE
+}
+
+
+## This function gets the display data for a given expression list.
+## It returns NULL if it finds no data, and a list with the names being the display name
+## and the value being the display value.
+getLineDisplayData <- function(lineState,envir) {
+  exprCount <- length(lineState$exprs)
+  if(exprCount == 0) return(NULL)
+  
+  ##only read from the last expression in the line/cell
+  lineExpr <- lineState$exprs[[exprCount]]
+  
+  if(isAssignment(lineExpr)) {
+    targetExpr <- lineExpr[[2]]
+    tryCatch({
+      displayData <- list()
+      if(class(targetExpr) == "name") {
+        name <- as.character(targetExpr)
+        lookupKey <- lineState$envVarNames[name]
+        if(!is.null(lookupKey)) { ##it should find this name
+          displayData$label <- name
+          displayData$lookupKey <- lookupKey
+        }
+        else {
+          displayData <- NULL
+        }
+      }
+      else if(rlang::is_call(targetExpr)) {
+        displayData$label <- deparse(targetExpr)[[1]]
+        displayData$value <- eval(targetExpr,envir=envir)
+      }
+      displayData
+    },
+    error=function(err) {
+      ##no action 
+      NULL
+    })
+  }
+  else {
+    NULL
+  }
+}
+
 ##----------------------------
 ## doc command implementations
 ##----------------------------
@@ -534,7 +702,7 @@ commandList$add <- function(docState,cmd) {
       docState$firstDirtyIndex <- currentLine
   }
   
-  docState
+  invisible(docState)
 }
 
 commandList$update <- function(docState,cmd) {
@@ -557,7 +725,7 @@ commandList$update <- function(docState,cmd) {
     docState$firstDirtyIndex <- currentLine
   }
 
-  docState
+  invisible(docState)
 }
 
 commandList$delete <- function(docState,cmd) {
@@ -574,7 +742,7 @@ commandList$delete <- function(docState,cmd) {
   ## delete entry
   docState$lines[[cmd$lineId]] = NULL
 
-  docState
+  invisible(docState)
 }
 
 commandList$multi <- function(docState,cmd) {
@@ -594,7 +762,7 @@ commandList$multi <- function(docState,cmd) {
     docState <- cmdFunc(docState,childCmd)
   }
   
-  docState
+  invisible(docState)
 }
 
 processCode <- function(entry,code) {
@@ -636,24 +804,53 @@ sendEvalMessage <- function(docSessionId,lineId,cmdIndex) {
   ))
 }
 
-sendValuesMessage <- function(docSessionId,lineObj) {
-  vals <- lineObj$outVarList[c(lineObj$created,lineObj$updated)]
-  ##vals <- vals[!is.function(vals) & !startsWith(names(vals),".")]
-  for(nm in names(vals)) {
-    if(!startsWith(nm,".")) {
-      val <- vals[[nm]]
-      if(!is.function(val)) {
-        print(nm); str(val)
-      }
+sendLineDisplayMessage <- function(docSessionId,lineState) {
+  if(!is.null(lineState$displayData)) {
+    displayData <- lineState$displayData
+    data <- list(lineId=jsonlite::unbox(lineState$lineId))
+    entry <- list()
+    entry$label <- jsonlite::unbox(displayData$label)
+    if(!is.null(displayData$lookupKey)) {
+      entry$lookupKey <- jsonlite::unbox(displayData$lookupKey)
     }
+    else if(!is.null(displayData$value)) {
+      entry$value <- preserialize(displayData$value)
+    }
+    data$valList <- list(entry) ##unamed list to make json array. For now there is just one entry. We may allow more later
+    sendMessage(type="lineDisplay",docSessionId,data)
   }
+}
+
+sendCellEnvMessage <- function(docSessionId,lineState) {
+  varList <- lapply(as.list(lineState$envVarNames),jsonlite::unbox)
+  data <- list(lineId=jsonlite::unbox(lineState$lineId),varList=varList)
+  sendMessage(type="cellEnv",docSessionId,data)
+}
+
+sendDocEnvMessage <- function(docState,lineId,addList,dropNames) {
+  changes <- list()
+  if(length(addList) > 0) {
+    changes$adds <- lapply(addList,preserialize)
+  }
+  if(length(dropNames) > 0) {
+    changes$drops <- dropNames
+  }
+  if(length(changes) > 0) {
+    data <- list(lineId=jsonlite::unbox(lineId),cmdIndex=jsonlite::unbox(docState$cmdIndex),changes=changes)
+    sendMessage(type="docEnv",docState$docSessionId,data)
+  }
+}
+
+sendCellStatusMessage <- function(docState,lineState) {
+  data <- list(lineId=jsonlite::unbox(lineState$lineId),cmdIndex=jsonlite::unbox(docState$cmdIndex))
+  sendMessage(type="cellStatus",docState$docSessionId,data)
 }
 
 ## This sends the status of the document after completion of the evaluation
 ## It includes:
 ## - evalComplete - if false, further evaluation is necessary
 ## - nextIndex - included if evaluation necessary. The line index that next needs to be evaluated
-sendCompletionStatus <- function(docState) {
+sendDocStatus <- function(docState) {
   evalComplete <- docState$firstDirtyIndex > length(docState$lines)
   data <- list(
     evalComplete=jsonlite::unbox(evalComplete),
@@ -684,6 +881,52 @@ sendMessage <- function(type,docSessionId,data) {
   body <- list(type=jsonlite::unbox(type),
                session=jsonlite::unbox(docSessionId),
                data=data)
-  print(paste(MESSAGE_HEADER,jsonlite::toJSON(body),MESSAGE_FOOTER,sep=""))
+  print(paste(MESSAGE_HEADER,makeJson(body),MESSAGE_FOOTER,sep=""))
+}
+
+
+##=============================================
+## future interface to read environment variables
+##=============================================
+
+
+loadLibEnvVars <- function() {
+  libEnvVars <- getAllLibEnvVars()
+  jsonlite::toJSON(libEnvVars)
+}
+
+loadNamedLibEnvVars <- function(pkgName) {
+  libEnvVars <- getNamedLibEnvVars(pkgName)
+  jsonlite::toJSON(libEnvVars)
+}
+
+getAllLibEnvVars <- function() {
+  libData <- list()
+  envir <- rlang::global_env()
+  while(!identical(envir,rlang::empty_env())) {
+    envir <- rlang::env_parent(envir)
+    libData[[length(libData)+1]] <- processEnvir(envir)
+  }
+  libData
+}
+
+getNamedLibEnvVars <- function(pkgName) {
+  libData <- list()
+  envir <- rlang::global_env()
+  while(!identical(envir,rlang::empty_env())) {
+    envir <- rlang::env_parent(envir)
+    if(identical(attributes(envir)$name,pkgName)) {
+      return(processEnvir(envir))
+    }
+  }
+  NULL
+}
+
+processEnvir <- function(envir) {
+  entry <- list()
+  entry$name <- attributes(envir)$name
+  entry$path <- attributes(envir)$path
+  entry$var <- lapply(envars,preserialize)
+  entry
 }
 
